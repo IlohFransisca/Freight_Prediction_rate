@@ -1,12 +1,9 @@
 """Freight Rate Predictor (Streamlit).
 
-Run locally:  streamlit run app.py
-Deploy:       push to GitHub, point Streamlit Cloud at app.py
+Always trains from CSV on startup — avoids sklearn-version pickle issues.
 """
-import sys
 from pathlib import Path
 
-import joblib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -20,8 +17,7 @@ from sklearn.preprocessing import OrdinalEncoder
 
 
 # --------------------------------------------------------------------------
-# Model classes — MUST be defined at __main__ level so joblib can unpickle
-# the saved freight_rate_model.joblib (its pickle references __main__.Xxx).
+# Model
 # --------------------------------------------------------------------------
 STATIC_NUM = ['distance', 'log_distance', 'weight', 'weight_missing',
               'pickup_lat', 'delivery_lat', 'delivery_lon',
@@ -31,8 +27,6 @@ T0 = pd.Timestamp('2025-01-01')
 
 
 class FreightFeatureEngineer(BaseEstimator, TransformerMixin):
-    """Clean raw freight rows. quote_signal is deliberately NOT used."""
-
     def fit(self, X, y=None):
         return self
 
@@ -40,18 +34,14 @@ class FreightFeatureEngineer(BaseEstimator, TransformerMixin):
         df = X.copy()
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
         df['dow'] = df['date'].dt.dayofweek
-
         for c in ['distance', 'weight', 'market_index',
                   'pickup_lat', 'pickup_lon', 'delivery_lat', 'delivery_lon']:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
-
         df['weight_missing'] = df['weight'].isna().astype(int)
         df['weight'] = df['weight'].abs().clip(upper=47500)
-
         day_mean = df.groupby('date')['market_index'].transform('mean')
         df['market_index'] = df['market_index'].fillna(day_mean)
-
         df['log_distance'] = np.log(df['distance'])
         df['bearing_ew'] = df['delivery_lon'] - df['pickup_lon']
         df['bearing_ns'] = df['delivery_lat'] - df['pickup_lat']
@@ -59,8 +49,6 @@ class FreightFeatureEngineer(BaseEstimator, TransformerMixin):
 
 
 class TwoStageRegressor(BaseEstimator, RegressorMixin):
-    """log(rate) = boosted trees on lane/equipment/weight + slope * market_index."""
-
     def __init__(self, block=14, carry_days=60, iters=2, seed=42):
         self.block = block
         self.carry_days = carry_days
@@ -124,65 +112,56 @@ def drop_label_errors(df, lo=1.0, hi=5.0):
     return df.loc[~bad].reset_index(drop=True)
 
 
-# Shim: ensure the classes are registered under __main__ so the saved pickle
-# can find them, no matter how Streamlit imported this file.
-_main = sys.modules.get("__main__")
-if _main is not None:
-    for _name in ("TwoStageRegressor", "FreightFeatureEngineer"):
-        if not hasattr(_main, _name) and _name in globals():
-            setattr(_main, _name, globals()[_name])
-
-
 # --------------------------------------------------------------------------
-# File lookup + cached loaders
+# CSV loading — tries multiple filenames, ignores empty / LFS pointer files
 # --------------------------------------------------------------------------
-def find_file(base: Path, names, subdirs=(".", "data")):
-    for sd in subdirs:
-        for n in names:
-            p = base / sd / n
-            if p.exists() and p.stat().st_size > 0:
-                return p
+def find_csv(base: Path, names):
+    for n in names:
+        for d in (base, base / "data"):
+            p = d / n
+            if not p.exists():
+                continue
+            size = p.stat().st_size
+            if size == 0:
+                continue
+            # Skip Git LFS pointer files (they start with "version https://git-lfs")
+            with open(p, "rb") as f:
+                head = f.read(64)
+            if head.startswith(b"version https://git-lfs"):
+                raise RuntimeError(
+                    f"{p} is a Git LFS pointer, not the real CSV. "
+                    "Re-upload the original file."
+                )
+            return p
     return None
 
 
-@st.cache_resource(show_spinner=False)
-def load_model(base: Path):
-    """Load the trained .joblib. Fall back to training from CSV only if needed."""
-    candidates = [
-        base / "freight_rate_model.joblib",
-        base / "final_model.joblib",
-        base / "model" / "bundle.joblib",
-        base / "data" / "freight_rate_model.joblib",
-    ]
-    for p in candidates:
-        if p.exists() and p.stat().st_size > 0:
-            try:
-                m = joblib.load(p)
-                return m, f"loaded from {p.name}"
-            except Exception as e:
-                st.warning(f"Could not load {p.name}: {e}")
-
-    # Fallback: retrain
-    train_path = find_file(base, ["train-test.csv", "train_test.csv"])
+@st.cache_resource(show_spinner="Training the model — this takes about a minute on first load.")
+def train_from_csv(base: Path):
+    train_path = find_csv(base, ["train-test.csv", "train_test.csv"])
     if train_path is None:
-        st.error("No model file and no training CSV found.")
+        st.error("Training CSV not found in the repository. "
+                 "Upload train-test.csv (or train_test.csv) to the repo root.")
         st.stop()
+
     train_df = pd.read_csv(train_path, parse_dates=["date"])
+    if train_df.empty or "posted_rate" not in train_df.columns:
+        st.error(f"{train_path.name} appears empty or malformed "
+                 f"(shape={train_df.shape}, columns={list(train_df.columns)[:5]}...). "
+                 "Re-upload the original CSV from your machine.")
+        st.stop()
+
     clean = drop_label_errors(train_df)
     X = clean.drop(columns=['posted_rate', 'load_id', 'quote_signal'], errors='ignore')
-    m = build_model().fit(X, clean['posted_rate'])
-    return m, "trained from CSV (model file not readable)"
+    model = build_model().fit(X, clean['posted_rate'])
+
+    return model, train_df
 
 
 @st.cache_data(show_spinner=False)
 def load_reference(base: Path):
-    """Cities, equipment, market_index by date, default lane distances."""
-    train_path = find_file(base, ["train-test.csv", "train_test.csv"])
-    val_path = find_file(base, ["validation.csv"])
-
-    if train_path is None:
-        st.error("Training CSV not found. Put train-test.csv or train_test.csv in the repo root.")
-        st.stop()
+    train_path = find_csv(base, ["train-test.csv", "train_test.csv"])
+    val_path = find_csv(base, ["validation.csv"])
 
     train_df = pd.read_csv(train_path, parse_dates=["date"])
     val_df = pd.read_csv(val_path, parse_dates=["date"]) if val_path else pd.DataFrame()
@@ -190,11 +169,10 @@ def load_reference(base: Path):
     cities = sorted(set(train_df["pickup"]) | set(train_df["delivery"]))
     equipment = sorted(train_df["equipment"].dropna().unique())
 
-    mi_frames = [train_df[["date", "market_index"]]]
+    frames = [train_df[["date", "market_index"]]]
     if not val_df.empty and "market_index" in val_df.columns:
-        mi_frames.insert(0, val_df[["date", "market_index"]])
-    mi = (pd.concat(mi_frames, ignore_index=True)
-            .groupby("date")["market_index"].mean().sort_index())
+        frames.insert(0, val_df[["date", "market_index"]])
+    mi = pd.concat(frames, ignore_index=True).groupby("date")["market_index"].mean().sort_index()
 
     lane_dist = train_df.groupby(["pickup", "delivery"])["distance"].median()
 
@@ -204,11 +182,12 @@ def load_reference(base: Path):
         "market_index": mi,
         "lane_distance": lane_dist,
         "train_dates": (train_df["date"].min(), train_df["date"].max()),
+        "coords_p": train_df.drop_duplicates("pickup").set_index("pickup")[["pickup_lat", "pickup_lon"]],
+        "coords_d": train_df.drop_duplicates("delivery").set_index("delivery")[["delivery_lat", "delivery_lon"]],
     }
 
 
 def market_for(ref, dates):
-    """Return (values Series, n_missing) — forward-fills the latest known index."""
     mi = ref["market_index"]
     s = pd.Series(pd.to_datetime(list(dates)))
     vals = s.map(mi)
@@ -222,7 +201,7 @@ def market_for(ref, dates):
 def default_distance(ref, pickup, delivery):
     ld = ref["lane_distance"]
     if (pickup, delivery) in ld.index:
-        return float(ld.loc[(pickup, delivery)]), "median distance for this lane in the training data"
+        return float(ld.loc[(pickup, delivery)]), "median distance for this lane"
     return 500.0, "no history for this lane — using a 500 mi placeholder"
 
 
@@ -231,6 +210,7 @@ REQUIRED = ["pickup", "delivery", "distance", "equipment", "weight", "date"]
 
 def predict_frame(model, ref, df):
     df = df.copy()
+
     if "market_index" not in df.columns or df["market_index"].isna().any():
         vals, _ = market_for(ref, df["date"])
         if "market_index" in df.columns:
@@ -238,33 +218,28 @@ def predict_frame(model, ref, df):
         else:
             df["market_index"] = vals.values
 
-    # Coordinates come from training data (lookup by city name)
-    train_path = find_file(Path(__file__).parent, ["train-test.csv", "train_test.csv"])
-    train_df = pd.read_csv(train_path)
+    df = df.join(ref["coords_p"], on="pickup").join(ref["coords_d"], on="delivery")
 
-    coords_p = train_df.drop_duplicates("pickup").set_index("pickup")[["pickup_lat", "pickup_lon"]]
-    coords_d = train_df.drop_duplicates("delivery").set_index("delivery")[["delivery_lat", "delivery_lon"]]
-
-    df = (df.join(coords_p, on="pickup").join(coords_d, on="delivery"))
-    # Unknown cities: fall back to the mean coordinate
-    df["pickup_lat"] = df["pickup_lat"].fillna(train_df["pickup_lat"].mean())
-    df["pickup_lon"] = df["pickup_lon"].fillna(train_df["pickup_lon"].mean())
-    df["delivery_lat"] = df["delivery_lat"].fillna(train_df["delivery_lat"].mean())
-    df["delivery_lon"] = df["delivery_lon"].fillna(train_df["delivery_lon"].mean())
+    # Unknown cities: use the mean coordinate
+    for c, src in [("pickup_lat", ref["coords_p"]["pickup_lat"]),
+                   ("pickup_lon", ref["coords_p"]["pickup_lon"]),
+                   ("delivery_lat", ref["coords_d"]["delivery_lat"]),
+                   ("delivery_lon", ref["coords_d"]["delivery_lon"])]:
+        df[c] = df[c].fillna(src.mean())
 
     return model.predict(df)
 
 
 # --------------------------------------------------------------------------
-# Streamlit UI
+# UI
 # --------------------------------------------------------------------------
 st.set_page_config(page_title="Freight Rate Predictor", page_icon="🚚", layout="wide")
 
 BASE = Path(__file__).parent
-model, model_status = load_model(BASE)
+model, train_df = train_from_csv(BASE)
 ref = load_reference(BASE)
 
-TYPICAL_ERROR = 0.0236  # mean MAPE across the three forward-in-time folds
+TYPICAL_ERROR = 0.0236
 
 st.title("🚚 Freight Rate Predictor")
 st.caption("Estimates the posted rate for a truckload from lane, equipment, weight, distance and date.")
@@ -276,7 +251,7 @@ with st.sidebar:
     equipment = st.selectbox("Equipment", ref["equipment"], index=0)
     weight = st.number_input("Weight (lb)", min_value=1000, max_value=47500, value=32000, step=500)
     if pickup == delivery:
-        st.warning("Pickup and delivery are the same city. Pick two different cities.")
+        st.warning("Pickup and delivery are the same city.")
         st.stop()
     dist_default, dist_note = default_distance(ref, pickup, delivery)
     distance = st.number_input("Distance (miles)", min_value=1.0, max_value=5000.0,
@@ -304,12 +279,12 @@ with tab1:
         m1, m2 = st.columns(2)
         m1.metric("Predicted rate", f"${pred:,.0f}")
         m2.metric("Per mile", f"${pred / distance:,.2f}")
-        st.caption(f"Typical error in validation is about {TYPICAL_ERROR:.1%}, so roughly "
-                   f"${pred * (1 - TYPICAL_ERROR):,.0f} to ${pred * (1 + TYPICAL_ERROR):,.0f}.")
+        st.caption(f"Typical error ≈ {TYPICAL_ERROR:.1%} "
+                   f"(${pred * (1 - TYPICAL_ERROR):,.0f} – ${pred * (1 + TYPICAL_ERROR):,.0f}).")
 
 with tab2:
-    st.write(f"Same load ({pickup} → {delivery}, {equipment}, {weight:,.0f} lb, {distance:,.0f} mi) "
-             "over a date range. Only the date and market index change.")
+    st.write(f"Same load ({pickup} → {delivery}, {equipment}, {weight:,.0f} lb, "
+             f"{distance:,.0f} mi) over a date range. Only the date and market index change.")
     d1, d2 = st.columns(2)
     start = d1.date_input("Start", value=pd.Timestamp("2025-12-01").date(), key="sweep_start")
     end = d2.date_input("End", value=pd.Timestamp("2025-12-31").date(), key="sweep_end")
@@ -325,8 +300,8 @@ with tab2:
         rates = predict_frame(model, ref, frame)
         out = pd.DataFrame({"date": days, "predicted_rate": rates.round(2)})
         fig, ax = plt.subplots(figsize=(8, 3.4))
-        ax.plot(out["date"], out["predicted_rate"], color="#064A56", linewidth=2.2,
-                marker="o", markersize=3)
+        ax.plot(out["date"], out["predicted_rate"], color="#064A56",
+                linewidth=2.2, marker="o", markersize=3)
         ax.set_ylabel("Predicted rate ($)")
         ax.grid(axis="y", color="#D9E2E4", linewidth=0.8)
         ax.spines[["top", "right"]].set_visible(False)
@@ -366,12 +341,11 @@ with tab3:
 
 with tab4:
     st.markdown(f"""
-**Model.** Gradient-boosted trees on log(rate) plus a blockwise slope on `market_index`
-and a carried-forward level for the slow drift in rates.
+**Model.** Gradient-boosted trees on log(rate) + blockwise slope on `market_index`
++ carried-forward level for slow drift.
 
-**Trained on** {ref['train_dates'][0].date()} → {ref['train_dates'][1].date()}.
-
-**Status:** {model_status}
+**Trained in-app** on {ref['train_dates'][0].date()} → {ref['train_dates'][1].date()}
+(loads only once per deploy — cached).
 
 **Validation** (three forward-in-time folds, mean): MAE $57.07, RMSE $139.35, R² 0.989, MAPE 2.36%.
 
