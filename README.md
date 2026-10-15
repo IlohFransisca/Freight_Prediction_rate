@@ -2,9 +2,7 @@
 
 I predict `posted_rate` for the 12,000 loads in `validation.csv` (dated November and December 2025), using the 48,000 labeled loads in `train-test.csv` (January to October 2025). The notebook copies them into a `data/` folder as `data/validation.csv` and `data/train_test.csv`, the names the instructions and `score.py` use.
 
-**Live app:** https://freightrateapp-6pslgxfmjavyz3jtiqegxp.streamlit.app/ (the code is `app.py` in this repo)
-**Loom walkthrough:** [paste your Loom link here]
-
+**Live app:** https://freightpredictionrate-jkxmrxvei9xl9pgxnnnhau.streamlit.app/ (the code is `app.py` in this repo)
 ## Submission checklist
 
 | What the instructions ask for | Where it is |
