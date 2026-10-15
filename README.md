@@ -8,10 +8,9 @@ I predict `posted_rate` for the 12,000 loads in `validation.csv` (dated November
 | What the instructions ask for | Where it is |
 |---|---|
 | GitHub repository with solution code, dependencies and run instructions | This repo: `Freight_Prediction_rate.ipynb` (solution), `requirements.txt` (dependencies), this README (run instructions) |
-| `validation_predictions.csv` with exactly `load_id,predicted_rate` | `validation_predictions.csv`: 12,000 rows, two columns in that order, built from `data/validation_predictions_template.csv` |
+| `validation_predictions.csv` with exactly `load_id,predicted_rate` | `validation_predictions.csv`: 12,000 rows, two columns in that order, built from `validation_predictions_template.csv` |
 | Report (PDF or DOCX): approach to the train/validation split | `Freight_Rate_Report.docx`, section 2 |
 | Report: fixed December prediction chart produced by `score.py` | `Freight_Rate_Report.docx`, section 6 (`candidate_december.png`) |
-| 2-3 minute Loom: key findings, data-quality issues, reasoning behind the model, training and validation approach, code walkthrough | Link at the top of this README. The same topics are summarised in sections 3 to 6 below |
 
 ## What's in this repo
 
@@ -23,7 +22,7 @@ I predict `posted_rate` for the 12,000 loads in `validation.csv` (dated November
 | `score.py` | The provided checker, unchanged |
 | `requirements.txt` | Python packages for the notebook and the app |
 | `train-test.csv`, `validation.csv` | The labeled development data and the 12,000 loads to predict |
-| `data/` | The other input files from the assessment (the template and the December inputs), under the names `score.py` expects |
+| The other input files from the assessment (the template and the December inputs), under the names `score.py` expects |
 | `december_chart_inputs_filled.csv` | My predictions for the 31 December rows |
 | `candidate_december.png` | The December chart produced by `score.py` |
 | `rate_per_mile.png`, `quote_signal_by_month.png` | Figures from the data exploration |
